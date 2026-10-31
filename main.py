@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import hashlib
 import logging
 import ssdeep
@@ -13,7 +14,7 @@ def setup_argparse():
     """
     Sets up the argument parser for the command-line interface.
     """
-    parser = argparse.ArgumentParser(description="Find near-duplicate files using SimHash.")
+    parser = argparse.ArgumentParser(description="Find near-duplicate files using ssdeep fuzzy hashing, with xxhash used as an exact match check.")
     parser.add_argument("directory", help="The directory to scan for files.")
     parser.add_argument("--threshold", type=int, default=70,
                         help="Similarity threshold (0-100).  Higher values mean more similar files are grouped. Default: 70")
@@ -56,7 +57,8 @@ def calculate_hashes(filepath):
 
 def find_similar_files(directory, threshold, min_size):
     """
-    Finds near-duplicate files within a given directory using ssdeep.
+    Finds near-duplicate files within a given directory using ssdeep fuzzy
+    hashing, with the xxhash value used as an exact match check.
 
     Args:
         directory (str): The directory to scan.
@@ -64,78 +66,124 @@ def find_similar_files(directory, threshold, min_size):
         min_size (int): The minimum file size to consider.
 
     Returns:
-        dict: A dictionary where keys are representative files and values are lists of similar files.
-             Returns an empty dictionary if no similar files are found or an error occurs.
+        tuple or None: None when the directory argument is not a directory.
+        Otherwise a tuple (clusters, counts), where clusters is a list of
+        (representative, member list) pairs for groups of more than one file,
+        and counts is a dict with the number of files seen, skipped, and
+        hashed. Clusters are connected groups: files linked by a chain of
+        matches belong to one cluster even when the ends of the chain do not
+        match each other directly.
     """
     file_hashes = {}
-    clusters = {}
+    counts = {"seen": 0, "skipped": 0, "hashed": 0}
 
     if not os.path.isdir(directory):
         logging.error(f"Invalid directory: {directory}")
-        return {}
+        return None
 
     try:
         for root, _, files in os.walk(directory):
             for filename in files:
                 filepath = os.path.join(root, filename)
+                counts["seen"] += 1
                 if os.path.getsize(filepath) < min_size:
+                    counts["skipped"] += 1
                     logging.debug(f"Skipping {filepath} due to small size.")
                     continue
 
                 ssdeep_hash, xxhash_hash = calculate_hashes(filepath)
                 if ssdeep_hash and xxhash_hash:
                     file_hashes[filepath] = (ssdeep_hash, xxhash_hash)
+                    counts["hashed"] += 1
+                else:
+                    counts["skipped"] += 1
     except OSError as e:
         logging.error(f"OS error during file traversal: {e}")
-        return {}
+        return [], counts
     except Exception as e:
         logging.error(f"Unexpected error during file processing: {e}")
-        return {}
+        return [], counts
 
-    # Cluster files based on ssdeep similarity
-    for filepath1, (ssdeep_hash1, _) in file_hashes.items():
-        if filepath1 in clusters:
-            continue  # Already part of a cluster
+    # Union-find over the hashed files, so clusters are connected groups.
+    parent = {filepath: filepath for filepath in file_hashes}
 
-        cluster = [filepath1]
-        for filepath2, (ssdeep_hash2, _) in file_hashes.items():
-            if filepath1 != filepath2 and filepath2 not in clusters:
-                try:
-                    similarity = ssdeep.compare(ssdeep_hash1, ssdeep_hash2)
-                    if similarity >= threshold:
-                        cluster.append(filepath2)
-                        clusters[filepath2] = True # mark that file2 is already in the cluster
-                except ssdeep.error as e:
-                    logging.warning(f"ssdeep comparison error between {filepath1} and {filepath2}: {e}")
-                except Exception as e:
-                    logging.error(f"Unexpected comparison error between {filepath1} and {filepath2}: {e}")
-        if len(cluster) > 1:
-            yield filepath1, cluster
+    def find(path):
+        while parent[path] != path:
+            parent[path] = parent[parent[path]]
+            path = parent[path]
+        return path
+
+    def union(path_a, path_b):
+        root_a, root_b = find(path_a), find(path_b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    # Exact match pass: files with equal xxhash values are exact duplicates.
+    by_xxhash = {}
+    for filepath, (_, xxhash_hash) in file_hashes.items():
+        by_xxhash.setdefault(xxhash_hash, []).append(filepath)
+    for group in by_xxhash.values():
+        for other in group[1:]:
+            union(group[0], other)
+
+    # ssdeep pass: link every pair that meets the similarity threshold.
+    filepaths = list(file_hashes)
+    for i, filepath1 in enumerate(filepaths):
+        ssdeep_hash1 = file_hashes[filepath1][0]
+        for filepath2 in filepaths[i + 1:]:
+            ssdeep_hash2 = file_hashes[filepath2][0]
+            try:
+                similarity = ssdeep.compare(ssdeep_hash1, ssdeep_hash2)
+                if similarity >= threshold:
+                    union(filepath1, filepath2)
+            except ssdeep.error as e:
+                logging.warning(f"ssdeep comparison error between {filepath1} and {filepath2}: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected comparison error between {filepath1} and {filepath2}: {e}")
+
+    groups = {}
+    for filepath in filepaths:
+        groups.setdefault(find(filepath), []).append(filepath)
+
+    clusters = [(members[0], members) for members in groups.values() if len(members) > 1]
+    return clusters, counts
 
 
 def main():
     """
-    Main function to execute the SimHash-based duplicate file finder.
+    Main function to execute the ssdeep fuzzy hash duplicate file finder.
     """
     args = setup_argparse()
 
     # Set log level based on command-line argument
     logging.getLogger().setLevel(args.log_level)
 
-    logging.info(f"Starting SimHash deduplication in directory: {args.directory}")
+    logging.info(f"Starting ssdeep fuzzy hash deduplication in directory: {args.directory}")
 
     try:
-        for representative, cluster in find_similar_files(args.directory, args.threshold, args.min_size):
-            print(f"Cluster representative: {representative}")
-            for file in cluster:
-                print(f"  - {file}")
-            print("-" * 20)
-
+        result = find_similar_files(args.directory, args.threshold, args.min_size)
     except Exception as e:
         logging.critical(f"An unhandled exception occurred: {e}")
-        exit(1)
+        sys.exit(1)
 
-    logging.info("SimHash deduplication complete.")
+    if result is None:
+        logging.error(f"Cannot deduplicate: '{args.directory}' is not a directory.")
+        sys.exit(1)
+
+    clusters, counts = result
+    logging.info(f"Files seen: {counts['seen']}, skipped: {counts['skipped']}, hashed: {counts['hashed']}")
+
+    if counts["hashed"] == 0:
+        logging.error("No files were hashed, so no deduplication was performed.")
+        sys.exit(1)
+
+    for representative, cluster in clusters:
+        print(f"Cluster representative: {representative}")
+        for file in cluster:
+            print(f"  - {file}")
+        print("-" * 20)
+
+    logging.info("ssdeep fuzzy hash deduplication complete.")
 
 
 if __name__ == "__main__":
