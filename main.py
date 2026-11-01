@@ -37,6 +37,9 @@ def calculate_hashes(filepath):
                Returns (None, None) if an error occurs.
     """
     try:
+        # The whole file is read into memory for both hashes. A directory of
+        # large files is therefore bounded by the single largest file, and the
+        # content is read once and shared by the two hash calls below.
         with open(filepath, "rb") as f:
             file_content = f.read()
 
@@ -82,6 +85,10 @@ def find_similar_files(directory, threshold, min_size):
         return None
 
     try:
+        # A failure in this walk, a file vanishing between listing and sizing
+        # being the common one, lands in the handler below and returns an
+        # empty cluster list with partial counts. Files already hashed are
+        # discarded, not reported, so a raced scan reads as no duplicates.
         for root, _, files in os.walk(directory):
             for filename in files:
                 filepath = os.path.join(root, filename)
@@ -123,6 +130,10 @@ def find_similar_files(directory, threshold, min_size):
     for filepath, (_, xxhash_hash) in file_hashes.items():
         by_xxhash.setdefault(xxhash_hash, []).append(filepath)
     for group in by_xxhash.values():
+        # Equal xxhash values are treated as exact duplicates and unioned
+        # without an ssdeep comparison. xxh64 is fast and not collision
+        # proof; a collision here would merge two different files into one
+        # cluster with full confidence.
         for other in group[1:]:
             union(group[0], other)
 
@@ -130,6 +141,10 @@ def find_similar_files(directory, threshold, min_size):
     filepaths = list(file_hashes)
     for i, filepath1 in enumerate(filepaths):
         ssdeep_hash1 = file_hashes[filepath1][0]
+        # Every pair is compared, so the comparison count grows with the
+        # square of the hashed file count. Ten thousand files means roughly
+        # fifty million comparisons. This pass is the real size limit of the
+        # tool, well before memory is.
         for filepath2 in filepaths[i + 1:]:
             ssdeep_hash2 = file_hashes[filepath2][0]
             try:
@@ -145,6 +160,9 @@ def find_similar_files(directory, threshold, min_size):
     for filepath in filepaths:
         groups.setdefault(find(filepath), []).append(filepath)
 
+    # The representative is simply the first member the grouping met, in
+    # walk order. It carries no meaning about which file is the original,
+    # and a different traversal order would name a different one.
     clusters = [(members[0], members) for members in groups.values() if len(members) > 1]
     return clusters, counts
 
